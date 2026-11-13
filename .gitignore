@@ -2,3 +2,4 @@ raftlogs/
 tests/
 */cover.out
 *.log
+*.venv
