@@ -193,7 +193,6 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			Term:    n.GetCurrentTerm(),
 			VoteGranted: false,
 		}
-		return false, false
 
 	} else if request.LastLogTerm < n.GetCurrentTerm() {
 		// If candidate's last log term is less than ours, it is out of date. Do not vote for it.
@@ -203,8 +202,6 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			Term:    n.GetCurrentTerm(),
 			VoteGranted: false,
 		}
-
-		return false, false
 
 	} else if n.GetVotedFor() != "" && n.GetVotedFor() != request.Candidate.Id {
 
@@ -216,8 +213,6 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			VoteGranted: false,
 		}
 
-		return false, false
-
 	} else {
 		// Voting for candidate that requested vote
 		n.Out("Submitting vote")
@@ -228,9 +223,7 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			VoteGranted: true,
 		}
 
-		return true, true
-
 	}
 
-	return
+	return fallback, resetTimeout
 }
