@@ -16,16 +16,25 @@ func (n *Node) doFollower() stateFunction {
 	// follower state should do when it receives an incoming message on every
 	// possible channel.
 
+	timeout := randomTimeout(n.Config.ElectionTimeout)
+
 	for {
 		select {
-		case appendRequest := <-n.appendEntries:
-			n.handleAppendEntries(appendRequest)
-		
-		case voteRequest := <-n.requestVote:
-			n.handleRequestVote(voteRequest)
+		case <-timeout:
+			return n.doCandidate
 
-		// case clientRequest := <-n.clientRequest:
-		// 	replyChannel := clientRequest.reply
+		case msg := <-n.appendEntries:
+			if reset, _ := n.handleAppendEntries(msg); reset{
+				timeout = randomTimeout(n.Config.ElectionTimeout)
+			}
+		
+		case msg := <-n.requestVote:
+			if reset, _ := n.followerHandleRequestVote(msg); reset{
+				timeout = randomTimeout(n.Config.ElectionTimeout)
+			}
+
+		case msg := <-n.clientRequest:
+			msg.reply <- ClientReply{Status: ClientStatus_NOT_LEADER, LeaderHint: n.getLeader()}
 
 		case shutdown := <-n.gracefulExit:
 			if shutdown {
@@ -33,17 +42,6 @@ func (n *Node) doFollower() stateFunction {
 			}
 		}
 	}
-
-	return n.doFollower()
-
-	// for {
-	// 	select {
-	// 	case shutdown := <-n.gracefulExit:
-	// 		if shutdown {
-	// 			return nil
-	// 		}
-	// 	}
-	// }
 }
 
 // handleAppendEntries handles an incoming AppendEntriesMsg. It is called by a
@@ -179,24 +177,29 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 
 		return false, false
 	}
+	
+	if request.Term > n.GetCurrentTerm() {
+		n.SetCurrentTerm(request.Term)
+		n.setVotedFor("")
+	}
 
 	// Fallback since request term is equal or higher
 	fallback = true
 	// Reset timeout since we've accepted the leader as valid
-	resetTimeout = true
+	resetTimeout = false
 
-	if request.LastLogIndex < n.LastLogIndex() {
-		// If candidate's last log index is less than ours, it is out of date. Do not vote for it
-		n.Out("Received vote from candidate with last log index less than ours (req.lastLogIdx=%v, lastLogIdx=%v)", request.LastLogIndex, n.LastLogIndex())
+	if request.LastLogTerm < n.GetLog(n.LastLogIndex()).TermId {
+		// If candidate's last log term is less than ours, it is out of date. Do not vote for it.
+		n.Out("Received vote from candidate with last log term less than ours (req.lastLogTm=%v, lastLogTm=%v)", request.LastLogTerm, n.GetCurrentTerm())
 
 		reply <- RequestVoteReply{
 			Term:    n.GetCurrentTerm(),
 			VoteGranted: false,
 		}
 
-	} else if request.LastLogTerm < n.GetCurrentTerm() {
-		// If candidate's last log term is less than ours, it is out of date. Do not vote for it.
-		n.Out("Received vote from candidate with last log term less than ours (req.lastLogTm=%v, lastLogTm=%v)", request.LastLogTerm, n.GetCurrentTerm())
+	} else if request.LastLogIndex < n.LastLogIndex() {
+		// If candidate's last log index is less than ours, it is out of date. Do not vote for it
+		n.Out("Received vote from candidate with last log index less than ours (req.lastLogIdx=%v, lastLogIdx=%v)", request.LastLogIndex, n.LastLogIndex())
 
 		reply <- RequestVoteReply{
 			Term:    n.GetCurrentTerm(),
@@ -206,7 +209,7 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 	} else if n.GetVotedFor() != "" && n.GetVotedFor() != request.Candidate.Id {
 
 		// Voted for someone else
-		n.Out("Log entry already exists for PrevLogIndex")
+		n.Out("Voting for someone else")
 
 		reply <- RequestVoteReply{
 			Term:    n.GetCurrentTerm(),
@@ -222,8 +225,10 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			Term:    n.GetCurrentTerm(),
 			VoteGranted: true,
 		}
+		resetTimeout = true
+		return resetTimeout, fallback
 
 	}
-
-	return fallback, resetTimeout
+	return
+	
 }
