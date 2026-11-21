@@ -17,6 +17,8 @@ func (n *Node) doLeader() stateFunction {
 	// Hint: perform any initial work, and then consider what a node in the
 	// leader state should do when it receives an incoming message on every
 	// possible channel.
+
+
 	return nil
 }
 
@@ -30,7 +32,72 @@ func (n *Node) doLeader() stateFunction {
 // machine should be given the new log entries via processLogEntry.
 func (n *Node) sendHeartbeats() (fallback bool) {
 	// TODO: Students should implement this method
-	return true, true
+	for _, peer := range n.getPeers() {
+		if peer.Id == n.Self.Id {
+			continue
+		}
+
+		// for keeping track of entries a follower is missing
+		var entries []*LogEntry
+		for i := n.nextIndex[peer.Id]; i <= n.LastLogIndex(); i++ {
+			entries = append(entries, n.GetLog(i))
+		}
+
+		prevIndex := n.nextIndex[peer.Id] - 1
+
+		request := &AppendEntriesRequest{
+			Term: n.GetCurrentTerm(),
+			Leader: n.Self,
+			PrevLogIndex: prevIndex,
+			PrevLogTerm: n.GetLog(prevIndex).TermId,
+			Entries: entries,
+			LeaderCommit: n.CommitIndex.Load(),
+
+		}
+
+		reply, err := peer.AppendEntriesRPC(n, request)
+		if err != nil {
+			continue
+		}
+		if reply.Term > n.GetCurrentTerm() {
+			n.SetCurrentTerm(reply.Term)
+			n.setVotedFor("")
+			return true
+		} else if reply.Success == false {
+			if n.nextIndex[peer.Id] > 1 {
+				n.nextIndex[peer.Id] = n.nextIndex[peer.Id] - 1
+			}
+		} else if reply.Success == true {
+			n.matchIndex[peer.Id] = prevIndex + uint64(len(entries))
+			n.nextIndex[peer.Id] = n.matchIndex[peer.Id] + 1
+		}
+	}
+
+	// commits the highest index a majority has replicated in the current term
+	currentTerm := n.GetCurrentTerm()
+	peers := n.getPeers()
+
+	for N := n.LastLogIndex(); N > n.CommitIndex.Load(); N-- {
+		if n.GetLog(N).TermId != currentTerm {
+			break
+		}
+
+		count := 1
+		for _, peer := range peers {
+			if peer.Id != n.Self.Id && n.matchIndex[peer.Id] >= N {
+				count++
+			}
+		}
+
+		if count > len(peers)/2 {
+			for n.LastApplied.Load() < N {
+				n.processLogEntry(n.LastApplied.Inc())
+			}
+			n.CommitIndex.Store(N)
+			break
+		}
+	}
+	return false
 }
 
 // processLogEntry applies a single log entry to the finite state machine. It is
