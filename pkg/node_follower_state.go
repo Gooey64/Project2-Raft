@@ -197,7 +197,7 @@ func (n *Node) followerHandleRequestVote(msg RequestVoteMsg) (resetTimeout, fall
 			VoteGranted: false,
 		}
 
-	} else if request.LastLogIndex < n.LastLogIndex() {
+	} else if request.LastLogTerm == n.GetLog(n.LastLogIndex()).TermId && request.LastLogIndex < n.LastLogIndex() {
 		// If candidate's last log index is less than ours, it is out of date. Do not vote for it
 		n.Out("Received vote from candidate with last log index less than ours (req.lastLogIdx=%v, lastLogIdx=%v)", request.LastLogIndex, n.LastLogIndex())
 
