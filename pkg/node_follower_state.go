@@ -11,11 +11,6 @@ func (n *Node) doFollower() stateFunction {
 	n.Out("Transitioning to FollowerState")
 	n.setState(FollowerState)
 
-	// TODO: Students should implement this method
-	// Hint: perform any initial work, and then consider what a node in the
-	// follower state should do when it receives an incoming message on every
-	// possible channel.
-
 	timeout := randomTimeout(n.Config.ElectionTimeout)
 
 	for {
