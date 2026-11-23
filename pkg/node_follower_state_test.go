@@ -83,7 +83,7 @@ func TestFollowerRequestVote(t *testing.T) {
 			wantGrant:    false,
 			wantFallback: true,
 			wantTerm:     5,
-			wantVotedFor: "", // cleared by the term bump, never set
+			wantVotedFor: "",
 		},
 		{
 			name: "higher last-log term wins despite shorter log",
@@ -276,7 +276,7 @@ func TestHandleAppendEntries_PrevLogIndexTooHigh(t *testing.T) {
 	if reply.Success {
 		t.Fatal("expected rejection when PrevLogIndex > LastLogIndex")
 	}
-	// The leader is still valid; follower should reset and fall back.
+	// The leader is still valid, so the follower should reset and fall back.
 	if !reset || !fallback {
 		t.Errorf("reset=%v fallback=%v, want both true", reset, fallback)
 	}
@@ -335,7 +335,7 @@ func TestHandleAppendEntries_AppendsNewEntries(t *testing.T) {
 func TestHandleAppendEntries_TruncatesConflictingEntries(t *testing.T) {
 	n := newTestNode(t)
 	n.SetCurrentTerm(2)
-	storeLogs(n, 1, 1, 1) // indices 1..3, all term 1
+	storeLogs(n, 1, 1, 1) // indices 1 - 3, all term 1
 
 	leader := &RemoteNode{Id: "L", Addr: "l"}
 	reply, _, _ := appendEntries(n, &AppendEntriesRequest{
@@ -367,7 +367,6 @@ func TestHandleAppendEntries_PanicsOnLogGap(t *testing.T) {
 		reply := make(chan AppendEntriesReply, 1)
 		n.handleAppendEntries(AppendEntriesMsg{&AppendEntriesRequest{
 			Term: 1, Leader: leader, PrevLogIndex: 1, PrevLogTerm: 1,
-			// First new entry does not follow our last index.
 			Entries: []*LogEntry{{Index: 5, TermId: 1}},
 		}, reply})
 	})
@@ -643,7 +642,7 @@ func TestDoFollower_StaleMessagesDoNotResetTimeout(t *testing.T) {
 	n := newTestNode(t)
 	n.SetCurrentTerm(5)
 	n.setVotedFor("someone")
-	n.Config.ElectionTimeout = 60 * time.Millisecond // must fire by ~120ms
+	n.Config.ElectionTimeout = 60 * time.Millisecond
 	next := runState(n.doFollower)
 
 	deadline := time.After(waitTimeout)

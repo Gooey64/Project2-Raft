@@ -63,6 +63,18 @@ func TestRandomTimeout_IsRandomized(t *testing.T) {
 	}
 }
 
+func TestRandomTimeout_NonPositiveFiresImmediately(t *testing.T) {
+	// rand.Int63n panics on n <= 0, so a zero or negative minimum must be
+	// handled explicitly and must still produce a channel that fires.
+	for _, min := range []time.Duration{0, -time.Second} {
+		select {
+		case <-randomTimeout(min):
+		case <-time.After(waitTimeout):
+			t.Fatalf("randomTimeout(%v) never fired", min)
+		}
+	}
+}
+
 func TestRandomTimeout_IndependentChannels(t *testing.T) {
 	a := randomTimeout(5 * time.Millisecond)
 	b := randomTimeout(5 * time.Millisecond)
