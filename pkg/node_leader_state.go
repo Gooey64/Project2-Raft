@@ -1,8 +1,6 @@
 package pkg
 
 import (
-	"context"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,13 +11,130 @@ func (n *Node) doLeader() stateFunction {
 	n.Out("Transitioning to LeaderState")
 	n.setState(LeaderState)
 
-	// TODO: Students should implement this method
-	// Hint: perform any initial work, and then consider what a node in the
-	// leader state should do when it receives an incoming message on every
-	// possible channel.
+	n.setLeader(n.Self)
 
+	n.LeaderMutex.Lock()
+	lastIndex := n.LastLogIndex()
+	for _, peer := range n.getPeers() {
+		n.nextIndex[peer.Id] = lastIndex + 1
+		n.matchIndex[peer.Id] = 0
+	}
+	n.LeaderMutex.Unlock()
 
-	return nil
+	n.StoreLog(&LogEntry{
+		Index:  n.LastLogIndex() + 1,
+		TermId: n.GetCurrentTerm(),
+		Type:   CommandType_NOOP,
+	})
+	n.matchIndex[n.Self.Id] = n.LastLogIndex()
+
+	if fallback := n.sendHeartbeats(); fallback {
+		n.stepDownFromLeader(ClientStatus_NOT_LEADER)
+		return n.doFollower
+	}
+
+	ticker := time.NewTicker(n.Config.HeartbeatTimeout)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if fallback := n.sendHeartbeats(); fallback {
+				n.stepDownFromLeader(ClientStatus_NOT_LEADER)
+				return n.doFollower
+			}
+
+		case msg := <-n.appendEntries:
+			if _, fallback := n.handleAppendEntries(msg); fallback {
+				n.stepDownFromLeader(ClientStatus_NOT_LEADER)
+				return n.doFollower
+			}
+
+		case msg := <-n.requestVote:
+			if msg.request.Term > n.GetCurrentTerm() {
+				n.followerHandleRequestVote(msg)
+				n.stepDownFromLeader(ClientStatus_ELECTION_IN_PROGRESS)
+				return n.doFollower
+			}
+			msg.reply <- RequestVoteReply{
+				Term:        n.GetCurrentTerm(),
+				VoteGranted: false,
+			}
+
+		case msg := <-n.clientRequest:
+			n.leaderHandleClientRequest(msg)
+
+		case shutdown := <-n.gracefulExit:
+			if shutdown {
+				return nil
+			}
+		}
+	}
+}
+
+// leaderHandleClientRequest appends a client's request to the leader's log and
+// registers the client's reply channel so processLogEntry can answer it once
+// the entry has been committed and applied.
+func (n *Node) leaderHandleClientRequest(msg ClientRequestMsg) {
+	req := msg.request
+	nextIndex := n.LastLogIndex() + 1
+
+	var entry *LogEntry
+	if req.ClientId == 0 {
+		entry = &LogEntry{
+			Index:   nextIndex,
+			TermId:  n.GetCurrentTerm(),
+			Type:    CommandType_CLIENT_REGISTRATION,
+			CacheId: CreateCacheID(0, nextIndex),
+		}
+	} else {
+		cacheID := CreateCacheID(req.ClientId, req.SequenceNum)
+
+		if cached, ok := n.GetCachedReply(cacheID); ok {
+			msg.reply <- *cached
+			return
+		}
+
+		n.requestsMutex.Lock()
+		if _, pending := n.requestsByCacheID[cacheID]; pending {
+			n.requestsByCacheID[cacheID] = append(n.requestsByCacheID[cacheID], msg.reply)
+			n.requestsMutex.Unlock()
+			return
+		}
+		n.requestsMutex.Unlock()
+
+		entry = &LogEntry{
+			Index:   nextIndex,
+			TermId:  n.GetCurrentTerm(),
+			Type:    CommandType_STATE_MACHINE_COMMAND,
+			Command: req.StateMachineCmd,
+			Data:    req.Data,
+			CacheId: cacheID,
+		}
+	}
+
+	n.requestsMutex.Lock()
+	n.requestsByCacheID[entry.CacheId] = append(n.requestsByCacheID[entry.CacheId], msg.reply)
+	n.requestsMutex.Unlock()
+
+	n.StoreLog(entry)
+	n.matchIndex[n.Self.Id] = n.LastLogIndex()
+}
+
+// stepDownFromLeader tells every client still waiting on this leader that it
+// is no longer the leader, so they retry elsewhere instead of hanging.
+func (n *Node) stepDownFromLeader(status ClientStatus) {
+	n.requestsMutex.Lock()
+	defer n.requestsMutex.Unlock()
+	for cacheID, replies := range n.requestsByCacheID {
+		for _, ch := range replies {
+			ch <- ClientReply{
+				Status:     status,
+				LeaderHint: n.getLeader(),
+			}
+		}
+		delete(n.requestsByCacheID, cacheID)
+	}
 }
 
 // sendHeartbeats is used by the leader to send out heartbeats to each of
@@ -46,13 +161,12 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 		prevIndex := n.nextIndex[peer.Id] - 1
 
 		request := &AppendEntriesRequest{
-			Term: n.GetCurrentTerm(),
-			Leader: n.Self,
+			Term:         n.GetCurrentTerm(),
+			Leader:       n.Self,
 			PrevLogIndex: prevIndex,
-			PrevLogTerm: n.GetLog(prevIndex).TermId,
-			Entries: entries,
+			PrevLogTerm:  n.GetLog(prevIndex).TermId,
+			Entries:      entries,
 			LeaderCommit: n.CommitIndex.Load(),
-
 		}
 
 		reply, err := peer.AppendEntriesRPC(n, request)
