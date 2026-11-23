@@ -110,15 +110,28 @@ func (n *Node) requestVotes(currTerm uint64) (fallback, electionResult bool) {
 	// 	return false, true
 	// }
 
+	// Decide as soon as the outcome is known, instead of waiting for every peer.
+	// An unreachable or partitioned peer can take the full RPC timeout (2s) to
+	// answer, which is far longer than the election timeout.
 	// If unreachable, that counts as "no"
-	for range others {
+	for received := 0; received < len(others); received++ {
+		if votes >= majority {
+			return false, true
+		}
+		if votes+(len(others)-received) < majority {
+			return false, false // a majority is no longer possible
+		}
+
 		r := <-replies
 		if r.err != nil || r.resp == nil {
-			continue 
+			continue
 		}
 		if r.resp.Term > currTerm {
-			n.SetCurrentTerm(r.resp.Term)
-			n.setVotedFor("")
+			// Only move forward: this election may already be stale.
+			if r.resp.Term > n.GetCurrentTerm() {
+				n.SetCurrentTerm(r.resp.Term)
+				n.setVotedFor("")
+			}
 			return true, false
 		}
 		if r.resp.VoteGranted {

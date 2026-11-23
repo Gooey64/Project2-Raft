@@ -146,12 +146,29 @@ func (n *Node) stepDownFromLeader(status ClientStatus) {
 // up to that index. Once committed to that index, the replicated state
 // machine should be given the new log entries via processLogEntry.
 func (n *Node) sendHeartbeats() (fallback bool) {
-	// TODO: Students should implement this method
-	for _, peer := range n.getPeers() {
-		if peer.Id == n.Self.Id {
-			continue
-		}
+	currentTerm := n.GetCurrentTerm()
+	peers := n.getPeers()
 
+	type result struct {
+		peerID    string
+		prevIndex uint64
+		sent      int
+		reply     *AppendEntriesReply
+	}
+
+	var others []*RemoteNode
+	for _, peer := range peers {
+		if peer.Id != n.Self.Id {
+			others = append(others, peer)
+		}
+	}
+
+	// Send to every peer in parallel. An RPC to a partitioned peer can take the
+	// full RPC timeout (2s), so sending one at a time would starve the reachable
+	// followers of heartbeats and make them start elections.
+	// Buffered so late senders never block after we stop listening.
+	results := make(chan result, len(others))
+	for _, peer := range others {
 		// for keeping track of entries a follower is missing
 		var entries []*LogEntry
 		for i := n.nextIndex[peer.Id]; i <= n.LastLogIndex(); i++ {
@@ -161,7 +178,7 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 		prevIndex := n.nextIndex[peer.Id] - 1
 
 		request := &AppendEntriesRequest{
-			Term:         n.GetCurrentTerm(),
+			Term:         currentTerm,
 			Leader:       n.Self,
 			PrevLogIndex: prevIndex,
 			PrevLogTerm:  n.GetLog(prevIndex).TermId,
@@ -169,27 +186,45 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 			LeaderCommit: n.CommitIndex.Load(),
 		}
 
-		reply, err := peer.AppendEntriesRPC(n, request)
-		if err != nil {
-			continue
-		}
-		if reply.Term > n.GetCurrentTerm() {
-			n.SetCurrentTerm(reply.Term)
-			n.setVotedFor("")
-			return true
-		} else if reply.Success == false {
-			if n.nextIndex[peer.Id] > 1 {
-				n.nextIndex[peer.Id] = n.nextIndex[peer.Id] - 1
+		go func(peer *RemoteNode, request *AppendEntriesRequest, prevIndex uint64, sent int) {
+			reply, err := peer.AppendEntriesRPC(n, request)
+			if err != nil {
+				reply = nil
 			}
-		} else if reply.Success == true {
-			n.matchIndex[peer.Id] = prevIndex + uint64(len(entries))
-			n.nextIndex[peer.Id] = n.matchIndex[peer.Id] + 1
+			results <- result{peer.Id, prevIndex, sent, reply}
+		}(peer, request, prevIndex, len(entries))
+	}
+
+	// Wait for replies, but never longer than one heartbeat interval. Slow
+	// (partitioned) peers are simply retried on the next heartbeat.
+	// nextIndex/matchIndex are only touched here, on the leader's goroutine.
+	deadline := time.After(n.Config.HeartbeatTimeout)
+collect:
+	for range others {
+		select {
+		case r := <-results:
+			if r.reply == nil {
+				continue
+			}
+			if r.reply.Term > currentTerm {
+				if r.reply.Term > n.GetCurrentTerm() {
+					n.SetCurrentTerm(r.reply.Term)
+					n.setVotedFor("")
+				}
+				return true
+			}
+			if r.reply.Success {
+				n.matchIndex[r.peerID] = r.prevIndex + uint64(r.sent)
+				n.nextIndex[r.peerID] = n.matchIndex[r.peerID] + 1
+			} else if n.nextIndex[r.peerID] > 1 {
+				n.nextIndex[r.peerID]--
+			}
+		case <-deadline:
+			break collect
 		}
 	}
 
 	// commits the highest index a majority has replicated in the current term
-	currentTerm := n.GetCurrentTerm()
-	peers := n.getPeers()
 
 	for N := n.LastLogIndex(); N > n.CommitIndex.Load(); N-- {
 		if n.GetLog(N).TermId != currentTerm {
