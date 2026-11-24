@@ -26,7 +26,9 @@ func (n *Node) doLeader() stateFunction {
 		TermId: n.GetCurrentTerm(),
 		Type:   CommandType_NOOP,
 	})
+	n.LeaderMutex.Lock()
 	n.matchIndex[n.Self.Id] = n.LastLogIndex()
+	n.LeaderMutex.Unlock()
 
 	if fallback := n.sendHeartbeats(); fallback {
 		n.stepDownFromLeader(ClientStatus_NOT_LEADER)
@@ -118,7 +120,9 @@ func (n *Node) leaderHandleClientRequest(msg ClientRequestMsg) {
 	n.requestsMutex.Unlock()
 
 	n.StoreLog(entry)
+	n.LeaderMutex.Lock()
 	n.matchIndex[n.Self.Id] = n.LastLogIndex()
+	n.LeaderMutex.Unlock()
 }
 
 // stepDownFromLeader tells every client still waiting on this leader that it
@@ -149,13 +153,6 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 	currentTerm := n.GetCurrentTerm()
 	peers := n.getPeers()
 
-	type result struct {
-		peerID    string
-		prevIndex uint64
-		sent      int
-		reply     *AppendEntriesReply
-	}
-
 	var others []*RemoteNode
 	for _, peer := range peers {
 		if peer.Id != n.Self.Id {
@@ -163,11 +160,8 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 		}
 	}
 
-	// Send to every peer in parallel. An RPC to a partitioned peer can take the
-	// full RPC timeout (2s), so sending one at a time would starve the reachable
-	// followers of heartbeats and make them start elections.
-	// Buffered so late senders never block after we stop listening.
-	results := make(chan result, len(others))
+	done := make(chan bool, len(others)) // true = saw a higher term
+	n.LeaderMutex.Lock()
 	for _, peer := range others {
 		// for keeping track of entries a follower is missing
 		var entries []*LogEntry
@@ -188,43 +182,61 @@ func (n *Node) sendHeartbeats() (fallback bool) {
 
 		go func(peer *RemoteNode, request *AppendEntriesRequest, prevIndex uint64, sent int) {
 			reply, err := peer.AppendEntriesRPC(n, request)
-			if err != nil {
-				reply = nil
+			if err != nil || reply == nil {
+				done <- false
+				return
 			}
-			results <- result{peer.Id, prevIndex, sent, reply}
+			if reply.Term > currentTerm {
+				if reply.Term > n.GetCurrentTerm() {
+					n.SetCurrentTerm(reply.Term)
+					n.setVotedFor("")
+				}
+				done <- true
+				return
+			}
+
+			n.LeaderMutex.Lock()
+			// Ignore replies from a leadership term we are no longer in.
+			// (Checking the term is enough: leading again needs a higher term.)
+			if n.GetCurrentTerm() == currentTerm {
+				if reply.Success {
+					if match := prevIndex + uint64(sent); match > n.matchIndex[peer.Id] {
+						n.matchIndex[peer.Id] = match
+					}
+					if n.nextIndex[peer.Id] < n.matchIndex[peer.Id]+1 {
+						n.nextIndex[peer.Id] = n.matchIndex[peer.Id] + 1
+					}
+				} else if n.nextIndex[peer.Id] == prevIndex+1 && n.nextIndex[peer.Id] > 1 {
+					// Only back off once per nextIndex value, even if several
+					// stale rejections arrive.
+					n.nextIndex[peer.Id]--
+				}
+			}
+			n.LeaderMutex.Unlock()
+			done <- false
 		}(peer, request, prevIndex, len(entries))
 	}
+	n.LeaderMutex.Unlock()
 
-	// Wait for replies, but never longer than one heartbeat interval. Slow
-	// (partitioned) peers are simply retried on the next heartbeat.
-	// nextIndex/matchIndex are only touched here, on the leader's goroutine.
 	deadline := time.After(n.Config.HeartbeatTimeout)
 collect:
 	for range others {
 		select {
-		case r := <-results:
-			if r.reply == nil {
-				continue
-			}
-			if r.reply.Term > currentTerm {
-				if r.reply.Term > n.GetCurrentTerm() {
-					n.SetCurrentTerm(r.reply.Term)
-					n.setVotedFor("")
-				}
+		case higher := <-done:
+			if higher {
 				return true
-			}
-			if r.reply.Success {
-				n.matchIndex[r.peerID] = r.prevIndex + uint64(r.sent)
-				n.nextIndex[r.peerID] = n.matchIndex[r.peerID] + 1
-			} else if n.nextIndex[r.peerID] > 1 {
-				n.nextIndex[r.peerID]--
 			}
 		case <-deadline:
 			break collect
 		}
 	}
+	if n.GetCurrentTerm() != currentTerm {
+		return true
+	}
 
 	// commits the highest index a majority has replicated in the current term
+	n.LeaderMutex.Lock()
+	defer n.LeaderMutex.Unlock()
 
 	for N := n.LastLogIndex(); N > n.CommitIndex.Load(); N-- {
 		if n.GetLog(N).TermId != currentTerm {
